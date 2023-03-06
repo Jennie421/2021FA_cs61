@@ -1,0 +1,606 @@
+#include "kernel.hh"
+#include "k-apic.hh"
+#include "k-vmiter.hh"
+#include <atomic>
+
+// kernel.cc
+//
+//    This is the kernel.
+
+
+// INITIAL PHYSICAL MEMORY LAYOUT
+//
+//  +-------------- Base Memory --------------+
+//  v                                         v
+// +-----+--------------------+----------------+--------------------+---------/
+// |     | Kernel      Kernel |       :    I/O | App 1        App 1 | App 2
+// |     | Code + Data  Stack |  ...  : Memory | Code + Data  Stack | Code ...
+// +-----+--------------------+----------------+--------------------+---------/
+// 0  0x40000              0x80000 0xA0000 0x100000             0x140000
+//                                             ^
+//                                             | \___ PROC_SIZE ___/
+//                                      PROC_START_ADDR
+
+#define PROC_SIZE 0x40000       // initial state only
+proc ptable[NPROC];             // array of process descriptors
+                                // Note that `ptable[0]` is never used.
+proc* current;                  // pointer to currently executing proc
+
+#define HZ 100                  // timer interrupt frequency (interrupts/sec)
+static std::atomic<unsigned long> ticks; // # timer interrupts so far
+
+
+// Memory state
+//    Information about physical page with address `pa` is stored in
+//    `pages[pa / PAGESIZE]`. In the handout code, each `pages` entry
+//    holds an `refcount` member, which is 0 for free pages.
+//    You can change this as you see fit.
+
+pageinfo pages[NPAGES];
+
+
+[[noreturn]] void schedule();
+[[noreturn]] void run(proc* p);
+void exception(regstate* regs);
+uintptr_t syscall(regstate* regs);
+void memshow();
+
+
+// kernel_start(command)
+//    Initialize the hardware and processes and start running. The `command`
+//    string is an optional string passed from the boot loader.This function
+//    should implement the specification for `sys_page_alloc`
+//    in `u-lib.hh` (but in the handout code, it does not).
+
+static void process_setup(pid_t pid, const char* program_name);
+
+void kernel_start(const char* command) {
+    // initialize hardware
+    init_hardware();
+    log_printf("Starting WeensyOS\n");
+
+    ticks = 1;
+    init_timer(HZ);
+
+    // clear screen
+    console_clear();
+
+    // (re-)initialize kernel page table
+    for (vmiter it(kernel_pagetable);
+         it.va() < MEMSIZE_PHYSICAL;
+         it += PAGESIZE) {
+
+        if (it.va() == 0) {
+          it.map(it.va(), 0);  // nullptr is inaccessible even to the kernel
+        } else if (it.va() < PROC_START_ADDR && it.va() != 0xB8000) {
+          it.map(it.va(), PTE_P | PTE_W);   //0xB8000 holds CGA console
+        } else {
+          it.map(it.va(), PTE_P | PTE_W | PTE_U); //give user permission
+        }
+    }
+
+    // set up process descriptors
+    for (pid_t i = 0; i < NPROC; i++) {
+        ptable[i].pid = i;
+        ptable[i].state = P_FREE;
+    }
+    if (command && !program_image(command).empty()) {
+        process_setup(1, command);
+    // if (command && program_image::program_number(command) > 0) {
+    //     process_setup(1, program_image::program_number(command));
+    } else {
+        process_setup(1, "allocator");
+        process_setup(2, "allocator2");
+        process_setup(3, "allocator3");
+        process_setup(4, "allocator4");
+    }
+
+    // Switch to the first process using run()
+    run(&ptable[1]);
+}
+
+
+// kalloc(sz)
+//    Kernel memory allocator. Allocates `sz` contiguous bytes and
+//    returns a pointer to the allocated memory, or `nullptr` on failure.
+//
+//    The returned memory is initialized to 0xCC, which corresponds to
+//    the x86 instruction `int3` (this may help you debug). You'll
+//    probably want to reset it to something more useful.
+//
+//    On WeensyOS, `kalloc` is a page-based allocator: if `sz > PAGESIZE`
+//    the allocation fails; if `sz < PAGESIZE` it allocates a whole page
+//    anyway.
+//
+//    The handout code returns the next allocatable free page it can find.
+//    It checks all pages. (You could maybe make this faster!)
+
+void* kalloc(size_t sz) {
+    if (sz > PAGESIZE) {
+        return nullptr;
+    }
+
+    for (uintptr_t pa = 0; pa != MEMSIZE_PHYSICAL; pa += PAGESIZE) {
+        if (allocatable_physical_address(pa)
+            && !pages[pa / PAGESIZE].used()) {
+            ++pages[pa / PAGESIZE].refcount;
+            memset((void*) pa, 0xCC, PAGESIZE);
+            return (void*) pa;
+        }
+    }
+    return nullptr;
+}
+
+
+// kfree(kptr)
+//    Free `kptr`, which must have been previously returned by `kalloc`.
+//    If `kptr == nullptr` does nothing.
+
+void kfree(void* kptr) {
+
+    if (kptr == nullptr) {
+        return;
+    }
+
+    --pages[(uintptr_t)kptr / PAGESIZE].refcount;
+}
+
+
+// process_setup(pid, program_name)
+//    Load application program `program_name` as process number `pid`.
+//    This loads the application's code and data into memory, sets its
+//    %rip and %rsp, gives it a stack page, and marks it as runnable.
+
+void process_setup(pid_t pid, const char* program_name) {
+
+    init_process(&ptable[pid], 0);
+
+    // initialize process page table
+    ptable[pid].pagetable = kalloc_pagetable();
+
+    // obtain reference to the program image
+    program_image pgm(program_name);
+
+    // Copy the mappings from kernel_pagetable into this new page table
+    for (vmiter it(ptable[pid].pagetable), itk(kernel_pagetable);
+        it.va() < PROC_START_ADDR;
+        it += PAGESIZE, itk += PAGESIZE) {
+            it.map(itk.pa(), itk.perm());
+    }
+
+    // allocate and map all memory
+    for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
+             a < seg.va() + seg.size();
+             a += PAGESIZE) {
+
+            uintptr_t pa = (uintptr_t)kalloc(PAGESIZE);
+
+            //Change process_setup to map read-only program segments using read-only memory.
+            if (seg.writable()) {
+                vmiter(ptable[pid].pagetable, a).map(pa, PTE_PWU);
+            } else {
+                vmiter(ptable[pid].pagetable, a).map(pa, PTE_P | PTE_U);
+            }
+        }
+    }
+
+    // copy instructions and data into place
+    for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
+
+        //use iterator with kptr for a pointer to the physical address
+        void* seg_pa = vmiter(ptable[pid].pagetable, seg.va()).kptr();
+
+        //initialize to 0 first
+        memset(seg_pa, 0, seg.size());
+
+        //copy the actual data into the virtual adresses
+        memcpy(seg_pa, seg.data(), seg.data_size());
+    }
+
+    // mark entry point
+    ptable[pid].regs.reg_rip = pgm.entry();
+
+    // allocate stack
+    uintptr_t stack_addr = MEMSIZE_VIRTUAL - PAGESIZE;
+    ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
+
+    uintptr_t stack_pa = (uintptr_t)kalloc(PAGESIZE);
+    vmiter(ptable[pid].pagetable, stack_addr).map(stack_pa, PTE_PWU);
+
+    // mark process as runnable
+    ptable[pid].state = P_RUNNABLE;
+}
+
+
+// syscall_exit()
+//    Handles the SYSCALL_EXIT system call.
+//    Marks a process as free and free all of its memory.
+
+void syscall_exit(pid_t pid) {
+
+    //free physical page
+    for (vmiter vit(ptable[pid].pagetable); vit.va() < MEMSIZE_VIRTUAL; vit += PAGESIZE) {
+        //free user-accessible and not-shared pages
+        if (vit.user() && vit.writable() && vit.pa() != CONSOLE_ADDR) {
+            kfree(vit.kptr());
+            }
+    }
+
+    //free sublevel pagetables by looping with physical memory iters
+    for (ptiter pit(ptable[pid].pagetable); !pit.done(); pit.next()) {
+        kfree(pit.kptr());
+    }
+
+    //free toplevel patetable
+    kfree(ptable[pid].pagetable);
+    ptable[pid].state = P_FREE;
+
+    return;
+}
+
+
+// syscall_fork()
+//    Handles the SYSCALL_FORK system call.
+//    Starts a new process as a copy of an existing process
+
+pid_t syscall_fork() {
+
+    bool free_slot = false;
+    int cpid;
+    //look for a free slot in ptable[], skip index 0
+    for (int i = 1; i < NPROC; ++i) {
+        if (ptable[i].state == P_FREE) {
+            free_slot = true;
+            cpid = i;
+            break;
+        }
+    }
+
+    if (!free_slot) {
+        return -1;
+    }
+
+    //initialize child pagetable
+    x86_64_pagetable* pt = kalloc_pagetable();
+    if (!pt) {
+        return -1;
+    }
+    ptable[cpid].pagetable = pt;
+
+
+    for (vmiter it_child(ptable[cpid].pagetable, 0), it(current, 0);
+        it_child.va() < MEMSIZE_VIRTUAL;
+        it_child += PAGESIZE, it += PAGESIZE) {
+
+        //copy user-accessible and non-shared pages
+        if (it.user() && it.writable() && it.pa() != CONSOLE_ADDR) {
+
+            //allocate a new physical page for child
+            void* child_pa = kalloc(PAGESIZE);
+            //if out of physical memory
+            if (!child_pa) {
+                syscall_exit(cpid);
+                return -1;
+            }
+
+            //copy the data from the parent’s page into child_paout of physical memory
+            memcpy(child_pa, (void*)it.pa(), PAGESIZE);
+
+            //map child's virtural to physical
+            int r = it_child.try_map(child_pa, it.perm());
+            if (r != 0) {
+                syscall_exit(cpid);
+                return -1;
+            }
+        }
+        else {
+            int r = it_child.try_map(it.pa(), it.perm());
+            if (r != 0) {
+                syscall_exit(cpid);
+                return -1;
+            }
+        }
+    }
+
+    //copy regs into child
+    //memcpy(&ptable[cpid].regs, &ptable[current->pid].regs, sizeof(ptable[current->pid].regs));
+    ptable[cpid].regs = ptable[current->pid].regs;
+    //set child return value to 0
+    ptable[cpid].regs.reg_rax = 0;
+    //set child as runnable
+    ptable[cpid].state = P_RUNNABLE;
+
+    return cpid;
+}
+
+
+// syscall_kill()
+//    Allows one process to kill others.
+
+int syscall_kill(pid_t pid) {
+
+    if (pid <= 0 || pid >= NPROC) {
+        return -1;
+    }
+    if (ptable[pid].state == P_FREE || ptable[pid].state == P_BROKEN) {
+        return -1;
+    }
+
+    syscall_exit(pid);
+
+    return 0;
+}
+
+
+
+// exception(regs)
+//    Exception handler (for interrupts, traps, and faults).
+//
+//    The register values from exception time are stored in `regs`.
+//    The processor responds to an exception by saving application state on
+//    the kernel's stack, then jumping to kernel assembly code (in
+//    k-exception.S). That code saves more registers on the kernel's stack,
+//    then calls exception().
+//
+//    Note that hardware interrupts are disabled when the kernel is running.
+
+void exception(regstate* regs) {
+    // Copy the saved registers into the `current` process descriptor.
+    current->regs = *regs;
+    regs = &current->regs;
+
+    // It can be useful to log events using `log_printf`.
+    // Events logged this way are stored in the host's `log.txt` file.
+    /* log_printf("proc %d: exception %d at rip %p\n",
+                current->pid, regs->reg_intno, regs->reg_rip); */
+
+    // Show the current cursor location and memory state
+    // (unless this is a kernel fault).
+    console_show_cursor(cursorpos);
+    if (regs->reg_intno != INT_PF || (regs->reg_errcode & PFERR_USER)) {
+        memshow();
+    }
+
+    // If Control-C was typed, exit the virtual machine.
+    check_keyboard();
+
+
+    // Actually handle the exception.
+    switch (regs->reg_intno) {
+
+    case INT_IRQ + IRQ_TIMER:
+        ++ticks;
+        lapicstate::get().ack();
+        schedule();
+        break;                  /* will not be reached */
+
+    case INT_PF: {
+        // Analyze faulting address and access type.
+        uintptr_t addr = rdcr2();
+        const char* operation = regs->reg_errcode & PFERR_WRITE
+                ? "write" : "read";
+        const char* problem = regs->reg_errcode & PFERR_PRESENT
+                ? "protection problem" : "missing page";
+
+        if (!(regs->reg_errcode & PFERR_USER)) {
+            panic("Kernel page fault on %p (%s %s)!\n",
+                  addr, operation, problem);
+        }
+        console_printf(CPOS(24, 0), 0x0C00,
+                       "Process %d page fault on %p (%s %s, rip=%p)!\n",
+                       current->pid, addr, operation, problem, regs->reg_rip);
+        current->state = P_BROKEN;
+        break;
+    }
+
+    default:
+        panic("Unexpected exception %d!\n", regs->reg_intno);
+
+    }
+
+
+    // Return to the current process (or run something else).
+    if (current->state == P_RUNNABLE) {
+        run(current);
+    } else {
+        schedule();
+    }
+}
+
+
+// syscall(regs)
+//    System call handler.
+//
+//    The register values from system call time are stored in `regs`.
+//    The return value, if any, is returned to the user process in `%rax`.
+//
+//    Note that hardware interrupts are disabled when the kernel is running.
+
+int syscall_page_alloc(uintptr_t addr);
+void syscall_page_free(uintptr_t addr);
+
+uintptr_t syscall(regstate* regs) {
+    // Copy the saved registers into the `current` process descriptor.
+    current->regs = *regs;
+    regs = &current->regs;
+
+    // It can be useful to log events using `log_printf`.
+    // Events logged this way are stored in the host's `log.txt` file.
+    /* log_printf("proc %d: syscall %d at rip %p\n",
+                  current->pid, regs->reg_rax, regs->reg_rip); */
+
+    // Show the current cursor location and memory state.
+    console_show_cursor(cursorpos);
+    memshow();
+
+    // If Control-C was typed, exit the virtual machine.
+    check_keyboard();
+
+    // Actually handle the exception.
+    switch (regs->reg_rax) {
+
+    case SYSCALL_PANIC:
+        panic(nullptr);         // does not return
+
+    case SYSCALL_GETPID:
+        return current->pid;
+
+    case SYSCALL_YIELD:
+        current->regs.reg_rax = 0;
+        schedule();             // does not return
+
+    case SYSCALL_PAGE_ALLOC:
+        return syscall_page_alloc(current->regs.reg_rdi);
+        //If there isn’t enough free memory to successfully complete sys_page_alloc, the system call should return -1 to the caller.
+
+    case SYSCALL_FORK:
+        return syscall_fork();
+
+    case SYSCALL_EXIT:
+        syscall_exit(current->pid);
+        schedule();
+
+    case SYSCALL_KILL:
+        return syscall_kill(current->regs.reg_rdi);
+
+    case SYSCALL_PAGE_FREE:
+        syscall_page_free(current->regs.reg_rdi);
+        return 0;
+
+    default:
+        panic("Unexpected system call %ld!\n", regs->reg_rax);
+    }
+
+    panic("Should not get here!\n");
+}
+
+
+
+
+// sys_page_alloc(addr)
+//    Allocate a page of memory at address `addr`. The newly-allocated
+//    memory is initialized to 0. Any memory previously located at `addr`
+//    should be freed. Returns 0 on success and -1 on failure (out of
+//    memory or invalid argument).
+//
+//    `Addr` should be page-aligned (i.e., a multiple of PAGESIZE == 4096),
+//    >= PROC_START_ADDR, and < MEMSIZE_VIRTUAL.
+int syscall_page_alloc(uintptr_t addr) {
+
+    if (addr % PAGESIZE != 0) {     //pagesize not aligned
+        return -1;
+    }
+    if (addr < PROC_START_ADDR) {   //kernel memory
+        return -1;
+    }
+    if (addr >= MEMSIZE_VIRTUAL) {     //upper bound
+        return -1;
+    }
+
+    void* pa = kalloc(PAGESIZE);
+    if (!pa) {
+        return -1;
+    }
+
+    int r = vmiter(current, addr).try_map(pa, PTE_PWU);
+    if (r < 0) {
+        syscall_exit(current->pid);
+        return -1;
+    }
+
+    memset(pa, 0, PAGESIZE);
+
+    return 0;
+}
+
+
+
+// syscall_page_free(addr)
+//    Handles the SYSCALL_PAGE_FREE system call.
+//    Frees pages.
+
+void syscall_page_free(uintptr_t addr) {
+
+    vmiter vit(current, addr);
+    if (vit.user() && vit.writable() && vit.pa() != CONSOLE_ADDR) {
+        if (--pages[vit.pa() / PAGESIZE].refcount < 0) {
+            panic("Double free at %lx\n", addr);
+        }
+        vit.map(vit.pa(), PTE_U);
+    }
+}
+
+// schedule
+//    Pick the next process to run and then run it.
+//    If there are no runnable processes, spins forever.
+
+void schedule() {
+    pid_t pid = current->pid;
+    for (unsigned spins = 1; true; ++spins) {
+        pid = (pid + 1) % NPROC;
+        if (ptable[pid].state == P_RUNNABLE) {
+            run(&ptable[pid]);
+        }
+
+        // If Control-C was typed, exit the virtual machine.
+        check_keyboard();
+
+        // If spinning forever, show the memviewer.
+        if (spins % (1 << 12) == 0) {
+            memshow();
+            log_printf("%u\n", spins);
+        }
+    }
+}
+
+
+// run(p)
+//    Run process `p`. This involves setting `current = p` and calling
+//    `exception_return` to restore its page table and registers.
+
+void run(proc* p) {
+    assert(p->state == P_RUNNABLE);
+    current = p;
+
+    // Check the process's current pagetable.
+    check_pagetable(p->pagetable);
+
+    // This function is defined in k-exception.S. It restores the process's
+    // registers then jumps back to user mode.
+    exception_return(p);
+
+    // should never get here
+    while (true) {
+    }
+}
+
+
+// memshow()
+//    Draw a picture of memory (physical and virtual) on the CGA console.
+//    Switches to a new process's virtual memory map every 0.25 sec.
+//    Uses `console_memviewer()`, a function defined in `k-memviewer.cc`.
+
+void memshow() {
+    static unsigned last_ticks = 0;
+    static int showing = 0;
+
+    // switch to a new process every 0.25 sec
+    if (last_ticks == 0 || ticks - last_ticks >= HZ / 2) {
+        last_ticks = ticks;
+        showing = (showing + 1) % NPROC;
+    }
+
+    proc* p = nullptr;
+    for (int search = 0; !p && search < NPROC; ++search) {
+        if (ptable[showing].state != P_FREE
+            && ptable[showing].pagetable) {
+            p = &ptable[showing];
+        } else {
+            showing = (showing + 1) % NPROC;
+        }
+    }
+
+    extern void console_memviewer(proc* vmp);
+    console_memviewer(p);
+}
